@@ -39,6 +39,10 @@ Nagram XF 12.10.1 plugin build, plugin SDK 1.4.6.7, on a Pixel 6 Pro running the
 
 Not covered by that test: the side tabs layout and the topic list screen. The code handles both, but I only checked the top tabs on screen.
 
+## Background use (1.0.6)
+
+Android closed Nagram XF for using too much CPU in the background (43.6 seconds in 5 minutes on my phone), and part of that was this plugin. Since 1.0.5 the once a second dots alignment stops when the app goes to the background and when no dots are on screen, and starts again when you come back. Since 1.0.6 every typing dots animation is paused while the app is in the background and resumed when you return, so no typing indicator asks for frames while nobody can see it.
+
 ## License
 
 MIT
