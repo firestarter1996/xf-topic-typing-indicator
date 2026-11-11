@@ -2,7 +2,7 @@ __id__ = "topic_typing"
 __name__ = "Topic Typing Indicator"
 __description__ = "In forum groups every topic shows its own typing indicator, in the topic tabs, the topic list and the topic itself, even when people type in several topics at once. Made by [firestarter1996](https://github.com/firestarter1996)."
 __author__ = "firestarter1996"
-__version__ = "1.0.4"
+__version__ = "1.0.6"
 
 # Why stock only shows typing in one topic per group:
 #   MessagesController.updatePrintingStrings walks every group and, inside the
@@ -29,6 +29,13 @@ __version__ = "1.0.4"
 # stock's and ours, when nothing changed (a full rebuild still runs at least once a
 # second so late loaded names and action changes show). The UI thread gets work only
 # when the fixed texts or the topics with typing actually change.
+# Background (1.0.5, 11-10-2026): the dots phase realign ran once a second from the UI thread
+# for as long as ANY typing dots drawable said it was started, and a drawable stays started
+# after its row scrolls away or XF goes to the background. With the bridge bots typing all day
+# it ran nonstop: about 7% of a core on XF's main thread with the screen off (simpleperf on the
+# 8 Pro). Now it skips dots whose view is off screen, stops while XF is in the
+# background (ApplicationLoader.mainInterfacePaused) and starts again when XF comes back. One
+# Runnable is made at load and reused, instead of a new one every second.
 # Logcat tag: TopicTyping.
 
 import threading
@@ -194,22 +201,88 @@ class TopicTypingPlugin(BasePlugin):
         self.dots_st.setAccessible(True)
         self.dots_all = Collections.synchronizedMap(WeakHashMap())
         self.dots_timer = False
+        self.dots_paused = []
+
+        from android_utils import R
+        self.AppLoader = jclass("org.telegram.messenger.ApplicationLoader")
+        self.dots_run = R(self._realign_dots)   # one Runnable for the whole run, reused
 
         class DotsHook(MethodHook):
             def after_hooked_method(self, param):
                 try:
                     plugin.dots_all.put(param.thisObject, True)
-                    if not plugin.dots_timer:
-                        plugin.dots_timer = True
-                        run_on_ui_thread(plugin._realign_dots, 50)
+                    if bool(plugin.AppLoader.mainInterfacePaused):
+                        # started while XF is in the background: hold it until onResume
+                        param.thisObject.stop()
+                        if param.thisObject not in (plugin.dots_paused or []):
+                            plugin.dots_paused.append(param.thisObject)
+                        return
+                    plugin._kick_dots(50)
                 except Exception as e:
                     _log("dots hook: %s" % e)
+
+        class ResumeHook(MethodHook):
+            def after_hooked_method(self, param):
+                try:
+                    plugin._resume_dots()
+                    if not plugin.dots_all.isEmpty():
+                        plugin._kick_dots(50)
+                except Exception as e:
+                    _log("resume hook: %s" % e)
+
+        class PauseHook(MethodHook):
+            def after_hooked_method(self, param):
+                try:
+                    plugin._pause_dots()
+                except Exception as e:
+                    _log("pause hook: %s" % e)
+
+        la = find_class("org.telegram.ui.LaunchActivity")
+        if la is not None:
+            try:
+                self.hook_method(la.getDeclaredMethod("onResume"), ResumeHook())
+                self.hook_method(la.getDeclaredMethod("onPause"), PauseHook())
+            except Exception as e:
+                _log("resume: %s" % e)
 
         for m in cls.getDeclaredMethods():
             if m.getName() == "start" and len(m.getParameterTypes()) == 0:
                 self.hook_method(m, DotsHook())
 
+    def on_plugin_unload(self):
+        try:
+            self.dots_timer = True    # nothing restarts it
+            if getattr(self, "dots_run", None) is not None:
+                AndroidUtilities.cancelRunOnUIThread(self.dots_run)
+        except Exception as e:
+            _log("unload: %s" % e)
+
+    def _pause_dots(self):
+        """XF went to the background: stop every running typing dots animation (they keep asking
+        for frames at 30 fps even when nothing is on screen) and remember them for onResume."""
+        self.dots_paused = []
+        self.in_pause = True
+        for d in list(self.dots_all.keySet().toArray())[:128]:
+            if d is not None and d.isStarted():
+                d.stop()
+                self.dots_paused.append(d)
+
+    def _resume_dots(self):
+        self.in_pause = False
+        for d in getattr(self, "dots_paused", None) or []:
+            if d is not None and not d.isStarted():
+                d.start()
+        self.dots_paused = []
+
+    def _kick_dots(self, delay):
+        if not self.dots_timer and not bool(self.AppLoader.mainInterfacePaused):
+            self.dots_timer = True
+            AndroidUtilities.runOnUIThread(self.dots_run, int(delay))
+
     def _realign_dots(self):
+        if bool(self.AppLoader.mainInterfacePaused):
+            self.dots_timer = False    # background: stop; LaunchActivity.onResume starts it again
+            return
         try:
             drs = list(self.dots_all.keySet().toArray())[:64]
             now = int(time.time() * 1000)
@@ -217,6 +290,9 @@ class TopicTypingPlugin(BasePlugin):
             for d in drs:
                 if d is None or not d.isStarted():
                     continue
+                cb = d.getCallback()
+                if cb is not None and View.isInstance(cb) and not cb.isShown():
+                    continue    # its view is off screen
                 running += 1
                 el = self.dots_el.get(d)
                 st = self.dots_st.get(d)
@@ -227,7 +303,7 @@ class TopicTypingPlugin(BasePlugin):
             _log("realign dots: %s" % e)
             running = 0
         if running:
-            run_on_ui_thread(self._realign_dots, 1000)
+            AndroidUtilities.runOnUIThread(self.dots_run, 1000)
         else:
             self.dots_timer = False
 
