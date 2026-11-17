@@ -2,7 +2,7 @@ __id__ = "topic_typing"
 __name__ = "Topic Typing Indicator"
 __description__ = "In forum groups every topic shows its own typing indicator, in the topic tabs, the topic list and the topic itself, even when people type in several topics at once. Made by [firestarter1996](https://github.com/firestarter1996)."
 __author__ = "firestarter1996"
-__version__ = "1.0.6"
+__version__ = "1.0.7"
 
 # Why stock only shows typing in one topic per group:
 #   MessagesController.updatePrintingStrings walks every group and, inside the
@@ -36,12 +36,20 @@ __version__ = "1.0.6"
 # 8 Pro). Now it skips dots whose view is off screen, stops while XF is in the
 # background (ApplicationLoader.mainInterfacePaused) and starts again when XF comes back. One
 # Runnable is made at load and reused, instead of a new one every second.
+# Dots position (1.0.7, 11-17-2026): the dots over a bottom bar tab were centered once when the
+# tab was filled and once more 60 ms later. Dots made at the moment typing started were never
+# centered at all (a new View is already VISIBLE, so the "just became visible" branch was skipped)
+# and sat at the tab's top left corner until the next refill; a title that got its width later
+# than 60 ms had the same result. Now the dots are centered when they are made and shown, and one
+# shared layout listener on the tab's title centers them again whenever the title moves or changes
+# width, and again when the dots view itself is first laid out. No timer, no retry. The offset is clamped to the tab. Dots left behind by an older copy
+# of this plugin after a hot reload are removed when the tab is filled, and unload removes ours.
 # Logcat tag: TopicTyping.
 
 import threading
 import time
 
-from java import jclass, jint, jarray
+from java import jclass, jint, jarray, dynamic_proxy
 from base_plugin import BasePlugin, MethodHook
 from hook_utils import find_class, get_private_field
 from android_utils import run_on_ui_thread, dp
@@ -90,6 +98,22 @@ def _log(msg):
         pass
 
 
+class _TitleLaid(dynamic_proxy(jclass("android.view.View$OnLayoutChangeListener"))):
+    """One shared listener on the titles of bottom bar tabs that have typing dots. Runs only when
+    a title is laid out; does work only when its left or right edge changed."""
+
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def onLayoutChange(self, v, l, t, r, b, ol, ot, orr, ob):
+        try:
+            if l != ol or r != orr:
+                self.plugin._title_laid(v)
+        except Exception as e:      # an error in a callback must never reach XF
+            _log("title laid: %s" % e)
+
+
 def _res(key):
     return int(getattr(RString, key))
 
@@ -113,6 +137,9 @@ class TopicTypingPlugin(BasePlugin):
         self.state = {}      # controller hash -> {"h": typing list hash, "t": last rebuild, "acc": account}
         self.applied = {}    # account -> signature of the texts last put on screen
         self.posted_live = {}  # account -> live set last sent to the UI thread
+        self.unloaded = False
+        self.title_laid = _TitleLaid(self)
+        self.dots_cls = jclass("org.telegram.ui.Components.TypingDotsDrawable")
         try:
             self.neko = jclass("tw.nekomimi.nekogram.NekoConfig")
             self.ayu = jclass("tw.nekomimi.nekogram.filters.AyuFilter")
@@ -251,11 +278,35 @@ class TopicTypingPlugin(BasePlugin):
 
     def on_plugin_unload(self):
         try:
+            self.unloaded = True
             self.dots_timer = True    # nothing restarts it
             if getattr(self, "dots_run", None) is not None:
                 AndroidUtilities.cancelRunOnUIThread(self.dots_run)
         except Exception as e:
             _log("unload: %s" % e)
+        try:
+            run_on_ui_thread(self._remove_all_dots)
+        except Exception as e:
+            _log("unload dots: %s" % e)
+
+    def _remove_all_dots(self):
+        """Unload: take our dots views off their tabs so a reloaded copy starts clean."""
+        for dots in list(self.dots.values()):
+            try:
+                bg = dots.getBackground()
+                if bg is not None and bg.isStarted():
+                    bg.stop()
+                dots.setVisibility(View.GONE)
+                parent = dots.getParent()
+                dots.removeOnLayoutChangeListener(self.title_laid)
+                if parent is not None:
+                    tv = get_private_field(parent, "textView")
+                    if tv is not None:
+                        tv.removeOnLayoutChangeListener(self.title_laid)
+                    parent.removeView(dots)
+            except Exception as e:
+                _log("remove dots: %s" % e)
+        self.dots = {}
 
     def _pause_dots(self):
         """XF went to the background: stop every running typing dots animation (they keep asking
@@ -291,7 +342,7 @@ class TopicTypingPlugin(BasePlugin):
                 if d is None or not d.isStarted():
                     continue
                 cb = d.getCallback()
-                if cb is not None and View.isInstance(cb) and not cb.isShown():
+                if cb is not None and isinstance(cb, View) and not cb.isShown():
                     continue    # its view is off screen
                 running += 1
                 el = self.dots_el.get(d)
@@ -495,7 +546,29 @@ class TopicTypingPlugin(BasePlugin):
         topic = param.args[1]
         account = int(get_private_field(view, "currentAccount") or 0)
         self.tabs.put(view, "%d:%d:%d" % (account, did, int(topic.id)))
+        self._drop_stale_dots(view)
         self._update_tab(view, recenter=True)
+
+    def _drop_stale_dots(self, view):
+        """A stock tab has three children. Any extra one that carries a typing dots drawable and is
+        not this copy's dots view was left by an older copy of the plugin (hot reload): remove it."""
+        try:
+            n = int(view.getChildCount())
+            if n <= 3:
+                return
+            mine = self.dots.get(int(view.hashCode()))
+            for i in range(n - 1, 2, -1):
+                ch = view.getChildAt(i)
+                if ch is None or (mine is not None and ch == mine):
+                    continue
+                bg = ch.getBackground()
+                if bg is not None and isinstance(bg, self.dots_cls):
+                    if bg.isStarted():
+                        bg.stop()
+                    view.removeView(ch)
+                    _log("removed stale dots")
+        except Exception as e:
+            _log("stale dots: %s" % e)
 
     def _typing_in(self, account, did, tid):
         on = self.live.get(account, {}).get(did, ())
@@ -544,17 +617,24 @@ class TopicTypingPlugin(BasePlugin):
                 lp = FrameLayoutParams(dp(18), dp(13), Gravity.TOP | Gravity.RIGHT)
                 lp.topMargin = dp(2)
                 lp.rightMargin = dp(4)
+            dots.setVisibility(View.GONE)   # so the first show below runs the centering
             view.addView(dots, lp)
             self.dots[key] = dots
+            if horizontal:
+                tv = get_private_field(view, "textView")
+                if tv is not None:
+                    tv.removeOnLayoutChangeListener(self.title_laid)
+                    tv.addOnLayoutChangeListener(self.title_laid)
+                # the dots' own first layout can move them (getLeft is 0 until then): center again
+                dots.addOnLayoutChangeListener(self.title_laid)
         if dots.getParent() is None or dots.getParent() != view:
             return
         drawable = dots.getBackground()
         if show:
             if dots.getVisibility() != View.VISIBLE or recenter:
                 dots.setVisibility(View.VISIBLE)
+                # the title's layout listener centers again whenever the title moves or resizes
                 self._center_dots(view, dots)
-                # once more after the next layout pass, when the title has its width
-                run_on_ui_thread(lambda v=view, d=dots: self._center_dots(v, d), 60)
             if not drawable.isStarted():
                 drawable.start()
         else:
@@ -569,9 +649,39 @@ class TopicTypingPlugin(BasePlugin):
             if "Horizontal" not in str(view.getClass().getName()):
                 return
             tv = get_private_field(view, "textView")
-            if tv is None or tv.getWidth() <= 0:
+            if tv is None:
                 return
-            x = tv.getLeft() + (tv.getWidth() - dp(18)) / 2.0 - dots.getLeft()
-            dots.setTranslationX(float(x))
+            self._place_dots(view, tv, dots)
         except Exception as e:
             _log("center dots: %s" % e)
+
+    def _place_dots(self, view, tv, dots):
+        w = int(tv.getWidth())
+        if w <= 0:
+            return      # not laid out yet: the layout listener calls again when it is
+        dw = dp(18)
+        x = tv.getLeft() + (w - dw) / 2.0 - dots.getLeft()
+        hi = int(view.getWidth()) - dw - dots.getLeft()
+        if x > hi:
+            x = hi
+        lo = -dots.getLeft()
+        if x < lo:
+            x = lo      # never left of the tab, also when the tab is narrower than the dots
+        if abs(float(dots.getTranslationX()) - x) > 0.5:
+            dots.setTranslationX(float(x))
+
+    def _title_laid(self, v):
+        """The title of a tab with dots, or the dots view itself, moved or changed width: center
+        the dots over the title again."""
+        if self.unloaded:
+            return
+        view = v.getParent()
+        if view is None:
+            return
+        dots = self.dots.get(int(view.hashCode()))
+        if dots is None or dots.getParent() != view or dots.getVisibility() != View.VISIBLE:
+            return
+        tv = get_private_field(view, "textView")
+        if tv is None:
+            return
+        self._place_dots(view, tv, dots)
