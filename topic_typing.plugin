@@ -2,7 +2,7 @@ __id__ = "topic_typing"
 __name__ = "Topic Typing Indicator"
 __description__ = "In forum groups every topic shows its own typing indicator, in the topic tabs, the topic list and the topic itself, even when people type in several topics at once. Made by [firestarter1996](https://github.com/firestarter1996)."
 __author__ = "firestarter1996"
-__version__ = "1.0.7"
+__version__ = "1.0.8"
 
 # Why stock only shows typing in one topic per group:
 #   MessagesController.updatePrintingStrings walks every group and, inside the
@@ -44,6 +44,12 @@ __version__ = "1.0.7"
 # shared layout listener on the tab's title centers them again whenever the title moves or changes
 # width, and again when the dots view itself is first laid out. No timer, no retry. The offset is clamped to the tab. Dots left behind by an older copy
 # of this plugin after a hot reload are removed when the tab is filled, and unload removes ours.
+# Topic as the typer (1.0.8, 11-17-2026): in a forum, a BOT typing in a topic is shown as that topic,
+# "<topic emoji> <topic name> is typing", in the topic header, the topic list and everywhere else that
+# reads the typing text, for every topic, also when only one topic has typing. The emoji is the topic's
+# own icon (its custom emoji, drawn by an AnimatedEmojiSpan) or, for a topic with no icon, the emoji its
+# name starts with; never twice. People keep their own names. Texts are cached per typing state, so a
+# rebuild that changes nothing makes no new objects. A switch in the settings turns it off.
 # Logcat tag: TopicTyping.
 
 import threading
@@ -72,6 +78,7 @@ FrameLayoutParams = jclass("android.widget.FrameLayout$LayoutParams")
 WeakHashMap = jclass("java.util.WeakHashMap")
 Collections = jclass("java.util.Collections")
 REFRESH_S = 1.0   # a full rebuild at least this often while someone types
+MARK = "\ue0a1"   # stands where the topic's icon emoji goes until the span is set on it
 
 # Same order as the stock instanceof chain: (TL class, string key, type).
 _ACTIONS = [
@@ -125,6 +132,8 @@ class TopicTypingPlugin(BasePlugin):
             Header(text="Topic Typing Indicator"),
             Switch(key="tabs_dots", text="Typing dots on topic tabs", default=True,
                    subtext="Shows animated dots on a topic tab while someone types in that topic."),
+            Switch(key="topic_as_typer", text="Bots type as their topic", default=True,
+                   subtext="A bot typing in a topic shows as the topic's emoji and name, like \u2728 Gemini is typing."),
             Divider(text="The topic header and the topic list always show typing per topic."),
         ]
 
@@ -138,6 +147,7 @@ class TopicTypingPlugin(BasePlugin):
         self.applied = {}    # account -> signature of the texts last put on screen
         self.posted_live = {}  # account -> live set last sent to the UI thread
         self.unloaded = False
+        self.texts = {}      # typing state key -> (text, type), so an unchanged state reuses its text
         self.title_laid = _TitleLaid(self)
         self.dots_cls = jclass("org.telegram.ui.Components.TypingDotsDrawable")
         try:
@@ -154,6 +164,13 @@ class TopicTypingPlugin(BasePlugin):
             self.zalgo = jclass("tw.nekomimi.nekogram.helpers.MessageHelper")
         except Exception:
             self.zalgo = None
+        try:
+            self.aes = jclass("org.telegram.ui.Components.AnimatedEmojiSpan")
+            self.ssb = jclass("android.text.SpannableStringBuilder")
+            self.tu = jclass("android.text.TextUtils")
+        except Exception as e:
+            self.aes = None
+            _log("no emoji span: %s" % e)
         self.nc_cls = jclass("org.telegram.messenger.NotificationCenter")
         self.print_mask = int(jclass("org.telegram.messenger.MessagesController").UPDATE_MASK_USER_PRINT)
         for name, key, typ in _ACTIONS:
@@ -387,40 +404,97 @@ class TopicTypingPlugin(BasePlugin):
         except Exception:
             return arr
 
-    def _text(self, mc, arr):
-        """Stock group wording for one topic's typing users. Returns (text, type) or None."""
+    def _topic_label(self, mc, did, tid):
+        """(label, icon id) for a topic: label is the topic name with MARK in front when the topic
+        has its own icon (a leading emoji in the name is then left out, so it never shows twice);
+        a topic without an icon keeps its name as is (its own emoji, if any, already comes first)."""
+        try:
+            topic = mc.getTopicsController().findTopic(-did, tid if tid > 1 else 1)
+            if topic is None:
+                return None
+            title = str(topic.title or "").strip()
+            icon = int(topic.icon_emoji_id or 0)
+        except Exception:
+            return None
+        if not title:
+            return None
+        if icon == 0 or self.aes is None:
+            return title, 0
+        # leading emoji in the name ("\U0001F427WSL2", "\U0001F427 Deb"): the icon already shows one
+        n = 0
+        while n < len(title) and not title[n].isalnum() and (ord(title[n]) >= 0x2000 or title[n] in "\u200d\ufe0f"):
+            n += 1
+        if n:
+            title = title[n:].strip()
+        return (MARK + " " + title) if title else MARK, icon
+
+    def _who(self, mc, pu, did, tid, topical):
+        """Name shown for one typing user: the topic label for a bot in a forum topic, else stock's."""
+        user = mc.getUser(JLong(int(pu.userId)))
+        if user is None:
+            return None, 0
+        if topical and bool(user.bot):
+            lab = self._topic_label(mc, did, tid)
+            if lab is not None:
+                return lab
+        return self._name(user), 0
+
+    def _text(self, mc, arr, did=0, tid=0, topical=False):
+        """Stock group wording for one topic's typing users. Returns (text, type, icon) or None."""
         if len(arr) == 1:
             pu = arr[0]
-            user = mc.getUser(JLong(int(pu.userId)))
-            if user is None:
+            name, icon = self._who(mc, pu, did, tid, topical)
+            if name is None:
                 return None
-            name = self._name(user)
             action = pu.action
             for cls, key, typ in self.action_classes:
                 if action is not None and isinstance(action, cls):
                     if key == "IsEnjoyngAnimations":
-                        return LocaleController.formatString(key, _res(key), name, str(action.emoticon)), typ
-                    return LocaleController.formatString(key, _res(key), name), typ
-            return LocaleController.formatString("IsTypingGroup", _res("IsTypingGroup"), name), 0
+                        return LocaleController.formatString(key, _res(key), name, str(action.emoticon)), typ, icon
+                    return LocaleController.formatString(key, _res(key), name), typ, icon
+            return LocaleController.formatString("IsTypingGroup", _res("IsTypingGroup"), name), 0, icon
         names = []
+        icon = 0
         for pu in arr:
-            user = mc.getUser(JLong(int(pu.userId)))
-            if user is not None:
-                names.append(self._name(user))
+            name, ic = self._who(mc, pu, did, tid, topical)
+            if name is not None and (not topical or name not in names):   # one bot label per topic
+                names.append(name)
+                icon = icon or ic
             if len(names) == 2:
                 break
         if not names:
             return None
         label = ", ".join(names)
         if len(names) == 1:
-            return LocaleController.formatString("IsTypingGroup", _res("IsTypingGroup"), label), 0
+            return LocaleController.formatString("IsTypingGroup", _res("IsTypingGroup"), label), 0, icon
         if len(arr) > 2:
             plural = LocaleController.getPluralString("AndMoreTypingGroup", len(arr) - 2)
             try:
-                return JString.format(plural, label, JInteger(len(arr) - 2)), 0
+                return JString.format(plural, label, JInteger(len(arr) - 2)), 0, icon
             except Exception:
-                return "LOC_ERR: AndMoreTypingGroup", 0
-        return LocaleController.formatString("AreTypingGroup", _res("AreTypingGroup"), label), 0
+                return "LOC_ERR: AndMoreTypingGroup", 0, 0
+        return LocaleController.formatString("AreTypingGroup", _res("AreTypingGroup"), label), 0, icon
+
+    def _iconize(self, text, icon):
+        """Put the topic's custom emoji on MARK. Any failure drops MARK and its space instead."""
+        try:
+            i = int(self.tu.indexOf(text, JString(MARK)))
+        except Exception:
+            return text
+        if i < 0:
+            return text
+        sb = self.ssb(text)
+        try:
+            if not icon:
+                raise ValueError("no icon")
+            paint = Theme.dialogs_messageNamePaint
+            fm = paint.getFontMetricsInt() if paint is not None else None
+            sb.setSpan(self.aes(icon, fm), i, i + 1, 33)   # SPAN_EXCLUSIVE_EXCLUSIVE
+        except Exception as e:
+            _log("icon span: %s" % e)
+            end = i + 2 if i + 1 < int(sb.length()) and str(sb.charAt(i + 1)) == " " else i + 1
+            sb.delete(i, end)
+        return sb
 
     def _polish(self, text):
         try:
@@ -461,12 +535,56 @@ class TopicTypingPlugin(BasePlugin):
         st["t"] = now
         st["ran"] = True
 
+    def _is_forum(self, mc, did):
+        try:
+            chat = mc.getChat(JLong(-did))
+            return chat is not None and bool(chat.forum)
+        except Exception:
+            return False
+
+    def _has_bot(self, mc, threads):
+        try:
+            for tid in list(threads.keySet().toArray()):
+                lst = threads.get(JInteger(int(tid)))
+                if lst is None:
+                    continue
+                for pu in list(lst.toArray()):
+                    u = mc.getUser(JLong(int(pu.userId)))
+                    if u is not None and bool(u.bot):
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def _cached_text(self, mc, arr, did, tid, topical):
+        """(text, type) for one topic, reused while the same users do the same action under the same
+        topic name and icon, so a rebuild with no change makes no new text (no relayout, no new span)."""
+        lab = self._topic_label(mc, did, tid) if topical else None
+        key = (did, tid, topical, lab,
+               tuple((int(pu.userId), str(pu.action.getClass().getName()) if pu.action is not None else "",
+                      str(getattr(pu.action, "emoticon", "") or "")) for pu in arr))
+        hit = self.texts.get(key)
+        if hit is not None:
+            return hit
+        res = self._text(mc, arr, did, tid, topical)
+        if res is None:
+            return None
+        text = self._polish(res[0])
+        if topical:
+            text = self._iconize(text, res[2])
+        out = (text, res[1])
+        if len(self.texts) > 256:
+            self.texts.clear()
+        self.texts[key] = out
+        return out
+
     def _after_printing(self, mc):
         st = self.state.get(int(mc.hashCode()))
         if st is not None and not st["ran"]:
             return
         fixes = {}
         live = {}
+        topical_on = bool(self.get_setting("topic_as_typer", True))
         users = mc.printingUsers
         for did in list(users.keySet().toArray()):
             did = int(did)
@@ -484,8 +602,9 @@ class TopicTypingPlugin(BasePlugin):
                     on.add(int(tid))
             if on:
                 live[did] = on
-            if threads.size() < 2:
-                continue  # one topic typing: stock text is already right
+            topical = topical_on and self._is_forum(mc, did) and self._has_bot(mc, threads)
+            if threads.size() < 2 and not topical:
+                continue  # one topic typing, no bot: stock text is already right
             per = {}
             for tid in list(threads.keySet().toArray()):
                 tid = int(tid)
@@ -495,10 +614,10 @@ class TopicTypingPlugin(BasePlugin):
                 arr = self._filter(mc, list(lst.toArray()))
                 if not arr:
                     continue
-                res = self._text(mc, arr)
+                res = self._cached_text(mc, arr, did, tid, topical)
                 if res is None:
                     continue
-                per[tid] = (self._polish(res[0]), res[1])
+                per[tid] = res
             if per:
                 # nothing fixable yet (names not loaded): leave stock's text alone
                 fixes[did] = per
