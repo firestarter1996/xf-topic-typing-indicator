@@ -13,9 +13,10 @@ Forum groups only:
 * Every topic with someone typing shows "is typing" in its own header, at the same time as the other topics.
 * Every topic tab with someone typing shows animated dots over its title. This works for the tabs across the top and the tabs down the side.
 * The wording, names, emoji and actions (typing, recording, sending a photo and so on) are the same as stock. Blocked users stay hidden when that option is on.
-* Private chats, normal groups and channels behave exactly as before. A group where only one topic has someone typing is left to stock.
+* A bot typing in a topic shows as that topic's emoji and name (1.0.8, see below).
+* Private chats, normal groups and channels behave exactly as before. A group where only one topic has someone typing, and no bot, is left to stock.
 
-Setting: the tab dots can be switched off. The header fix is always on.
+Settings: the tab dots and the topic name for bots can each be switched off. The header fix is always on.
 
 ## Install
 
@@ -46,6 +47,12 @@ Android closed Nagram XF for using too much CPU in the background (43.6 seconds 
 ## Dots position (1.0.7)
 
 When someone started typing in a topic whose tab had never shown dots before, the dots sat in the top left corner of the tab until the tab was filled again. On a selected tab with an outline that looked like the dots were pushed to the left. Since 1.0.7 the dots are centered over the tab title the moment they appear, and again whenever the title or the dots move or change width (a layout listener, no timer). The offset is kept inside the tab.
+
+## Topic as the typer (1.0.8)
+
+My forum has a bot per project, and some topics share one bot, so the header of a topic said the bot's name ("ClaudeCode is typing") instead of which topic was busy. Since 1.0.8, in a forum, a bot typing in a topic is shown as that topic: the topic's emoji and name, like "✨ Gemini is typing". The emoji is the topic's own icon (its custom emoji) or, for a topic without an icon, the emoji its name starts with, and it is never shown twice. This shows wherever the typing text appears (the topic header and the topic list), also when only one topic has typing. People keep their own names. A switch, "Bots type as their topic", turns it off.
+
+Texts are made only when the typing state changes and are reused while it stays the same, so this adds no work per frame and no new objects while a bot keeps typing.
 
 ## License
 
