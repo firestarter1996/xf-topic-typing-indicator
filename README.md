@@ -43,6 +43,10 @@ Not covered by that test: the side tabs layout and the topic list screen. The co
 
 Android closed Nagram XF for using too much CPU in the background (43.6 seconds in 5 minutes on my phone), and part of that was this plugin. Since 1.0.5 the once a second dots alignment stops when the app goes to the background and when no dots are on screen, and starts again when you come back. Since 1.0.6 every typing dots animation is paused while the app is in the background and resumed when you return, so no typing indicator asks for frames while nobody can see it.
 
+## Dots position (1.0.7)
+
+When someone started typing in a topic whose tab had never shown dots before, the dots sat in the top left corner of the tab until the tab was filled again. On a selected tab with an outline that looked like the dots were pushed to the left. Since 1.0.7 the dots are centered over the tab title the moment they appear, and again whenever the title or the dots move or change width (a layout listener, no timer). The offset is kept inside the tab.
+
 ## License
 
 MIT
